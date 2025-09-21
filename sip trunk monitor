@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# === Конфигурация ===
+TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN_HERE"
+TELEGRAM_CHAT_ID="YOUR_CHAT_ID_HERE"
+TRUNK_NAMES=("trunk" "trunk2")  # используем username вместо имени транка
+LOG_FILE="/var/log/trunk_monitor.log"
+
+# === Функции ===
+send_telegram() {
+    local message="$1"
+    curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TELEGRAM_CHAT_ID" \
+        -d text="$message" >/dev/null
+}
+
+check_trunks() {
+    local failed=()
+    local output
+    output=$(asterisk -rx "sip show registry" 2>/dev/null)
+
+    # Проверяем, что команда выполнена успешно
+    if [ $? -ne 0 ]; then
+        echo "Ошибка выполнения asterisk CLI" >&2
+        return 1
+    fi
+
+    for trunk in "${TRUNK_NAMES[@]}"; do
+        # Ищем username транка и статус Registered
+        if ! echo "$output" | grep -E "[[:space:]]+${trunk}[[:space:]]+.*Registered" >/dev/null; then
+            failed+=("$trunk")
+        fi
+    done
+
+    echo "${failed[@]}"
+}
+
+# === Основная логика ===
+failed_trunks=($(check_trunks))
+
+if [[ ${#failed_trunks[@]} -eq 0 ]]; then
+    # Все зарегистрированы
+    exit 0
+else
+    # Сообщаем о проблеме
+    msg="⚠️ Проблема с SIP-транками: ${failed_trunks[*]} (не зарегистрированы)"
+    echo "$(date) - $msg" >> "$LOG_FILE"
+    send_telegram "$msg"
+
+    # Перезапуск
+    fwconsole reload >/dev/null 2>&1
+    sleep 5
+
+    # Повторная проверка
+    failed_trunks=($(check_trunks))
+    if [[ ${#failed_trunks[@]} -eq 0 ]]; then
+        msg="✅ SIP-транки успешно перерегистрированы после reload"
+        echo "$(date) - $msg" >> "$LOG_FILE"
+        send_telegram "$msg"
+    else
+        msg="❌ SIP-транки не восстановились: ${failed_trunks[*]}"
+        echo "$(date) - $msg" >> "$LOG_FILE"
+        send_telegram "$msg"
+    fi
+fi
